@@ -1,0 +1,5 @@
+:root { font-family: Arial, sans-serif; color-scheme: light; }
+body { margin: 0; background: #f7f7f8; color: #111827; }
+main { max-width: 760px; margin: 0 auto; padding: 48px 20px; }
+.card { background: white; border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; }
+code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
