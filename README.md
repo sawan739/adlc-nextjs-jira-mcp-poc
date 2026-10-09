@@ -55,3 +55,4 @@ Do not add Jira, GitHub or MCP credentials to `.env.local`. Authentication belon
 - `09-ENV-AND-SECRETS.md` - where configuration belongs
 - `10-TROUBLESHOOTING.md` - common problems
 - `11-LEARNING-CHECKLIST.md` - mastery checklist
+- `12-AGENT-AUTOMATION.md` - Jira ticket → agent → pull request automation

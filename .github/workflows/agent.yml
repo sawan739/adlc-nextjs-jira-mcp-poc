@@ -1,0 +1,163 @@
+name: Agent
+
+# Turns a Jira ticket into a pull request. Triggered by a Jira Automation rule
+# (repository_dispatch) or manually from the Actions tab (workflow_dispatch).
+# Setup: docs/12-AGENT-AUTOMATION.md
+
+on:
+  repository_dispatch:
+    types: [jira-ticket]
+  workflow_dispatch:
+    inputs:
+      issue_key:
+        description: Jira issue key, e.g. KAN-12
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-${{ github.event.client_payload.issue_key || inputs.issue_key }}
+  cancel-in-progress: false
+
+env:
+  ISSUE_KEY_INPUT: ${{ github.event.client_payload.issue_key || inputs.issue_key }}
+  JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY || 'KAN' }}
+  BASE_BRANCH: ${{ vars.AGENT_BASE_BRANCH || 'staging' }}
+  CLAUDE_CODE_VERSION: 2.1.295
+  AGENT_MAX_TURNS: ${{ vars.AGENT_MAX_TURNS || '60' }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  agent:
+    name: Agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          # Keep git credentials away from the agent; the push step authenticates explicitly.
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch Jira ticket and check readiness
+        id: ticket
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: node scripts/agent/jira.ts fetch "$ISSUE_KEY_INPUT"
+
+      - name: Mark ticket In Progress
+        if: steps.ticket.outputs.ready == 'true'
+        env:
+          ISSUE_KEY: ${{ steps.ticket.outputs.key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: node scripts/agent/jira.ts start "$ISSUE_KEY" "$RUN_URL"
+
+      - name: Create feature branch
+        if: steps.ticket.outputs.ready == 'true'
+        env:
+          BRANCH: ${{ steps.ticket.outputs.branch }}
+        run: git checkout -b "$BRANCH"
+
+      - name: Install Claude Code
+        if: steps.ticket.outputs.ready == 'true'
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+      - name: Run agent
+        if: steps.ticket.outputs.ready == 'true'
+        timeout-minutes: 30
+        env:
+          # The only secret available to the agent.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p "$(cat scripts/agent/prompt.md)" \
+            --max-turns "$AGENT_MAX_TURNS" \
+            --output-format json \
+            --allowedTools "Read,Edit,Write,Glob,Grep,TodoWrite,Bash(npm run validate),Bash(npm run lint),Bash(npm run typecheck),Bash(npm run test),Bash(npm test),Bash(npm run build),Bash(git status),Bash(git diff:*),Bash(git log:*),Bash(ls:*)" \
+            --disallowedTools "WebFetch,WebSearch" \
+            > .agent/claude-result.json
+          node -e 'const r = require("./.agent/claude-result.json"); console.log(`turns=${r.num_turns} cost_usd=${r.total_cost_usd} is_error=${r.is_error}`); if (r.is_error) process.exit(1);'
+
+      - name: Re-run validation independently
+        if: steps.ticket.outputs.ready == 'true'
+        run: npm run validate
+
+      - name: Check the agent changed files
+        if: steps.ticket.outputs.ready == 'true'
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "The agent made no changes." >&2
+            exit 1
+          fi
+          # The agent must not modify CI or its own tooling.
+          if git status --porcelain -- .github scripts/agent | grep -q .; then
+            echo "The agent modified .github/ or scripts/agent/; refusing to open a PR." >&2
+            exit 1
+          fi
+
+      - name: Commit, push and open pull request
+        id: pr
+        if: steps.ticket.outputs.ready == 'true'
+        env:
+          # A PAT or GitHub App token, so the PR triggers the CI workflow.
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
+          ISSUE_KEY: ${{ steps.ticket.outputs.key }}
+          BRANCH: ${{ steps.ticket.outputs.branch }}
+          REVIEWERS: ${{ vars.AGENT_REVIEWERS }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+        run: |
+          SUMMARY="$(node -e 'console.log(require("./.agent/issue.json").summary)')"
+          git config user.name "adlc-agent[bot]"
+          git config user.email "adlc-agent@users.noreply.github.com"
+          git add -A
+          git commit -m "${ISSUE_KEY}: ${SUMMARY}" -m "Implemented by the ADLC agent workflow: ${RUN_URL}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          node scripts/agent/jira.ts pr-body "$ISSUE_KEY" > "$RUNNER_TEMP/pr-body.md"
+          REVIEWER_ARGS=()
+          if [ -n "$REVIEWERS" ]; then REVIEWER_ARGS=(--reviewer "$REVIEWERS"); fi
+          PR_URL="$(gh pr create --base "$BASE_BRANCH" --head "$BRANCH" --title "${ISSUE_KEY}: ${SUMMARY}" --body-file "$RUNNER_TEMP/pr-body.md" "${REVIEWER_ARGS[@]}")"
+          echo "url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Post pull request to Jira and move to In Review
+        if: steps.ticket.outputs.ready == 'true'
+        env:
+          ISSUE_KEY: ${{ steps.ticket.outputs.key }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: node scripts/agent/jira.ts review "$ISSUE_KEY" "$PR_URL" "$RUN_URL"
+
+      - name: Upload agent artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-output
+          path: .agent/
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+      - name: Report failure to Jira
+        if: failure() && steps.ticket.outputs.key != ''
+        env:
+          ISSUE_KEY: ${{ steps.ticket.outputs.key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: node scripts/agent/jira.ts fail "$ISSUE_KEY" "$RUN_URL"
